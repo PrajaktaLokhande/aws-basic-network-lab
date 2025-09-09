@@ -145,16 +145,5 @@ If first attempt fails due to dependencies, wait a minute and retry.
 
 ---
 
-## 📁 Repository Layout
 
-```
-cloudformation/
-  network-basic-vpc.yaml
-docs/
-  architecture.md
-.github/workflows/
-  cfn-validate.yml
-README.md
-LICENSE
-.gitignore
 ```
