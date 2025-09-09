@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Networking Lab - Basic VPC Playground (two VPCs with public/private subnets, IGW, NAT, EC2s).
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair name for SSH
+  YourIpCidr:
+    Type: String
+    Description: Your IP in CIDR form for SSH to public instances (e.g., 203.0.113.10/32)
+    Default: 0.0.0.0/0
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro]
+
+Mappings: {}
+
+Resources:
+  # Common (AMI)
+  AmiAL2023:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  ######################## VPC A ########################
+  VpcA:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab-vpc-a }]
+
+  IgwA:
+    Type: AWS::EC2::InternetGateway
+  AttachIgwA:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcA
+      InternetGatewayId: !Ref IgwA
+
+  SubnetAPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcA
+      CidrBlock: 10.10.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab-a-public }]
+
+  SubnetAPrivate:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcA
+      CidrBlock: 10.10.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab-a-private }]
+
+  RtAPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcA }
+  RtAssocAPublic:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetAPublic, RouteTableId: !Ref RtAPublic }
+  RtAPub0:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtAPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IgwA
+
+  EipNATA:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNATA.AllocationId
+      SubnetId: !Ref SubnetAPublic
+      ConnectivityType: public
+      Tags: [{ Key: Name, Value: lab-nat-a }]
+
+  RtAPrivate:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcA }
+  RtAssocAPrivate:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetAPrivate, RouteTableId: !Ref RtAPrivate }
+  RtAPri0:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtAPrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  SgAPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public SG - HTTP from world, SSH from your IP, ICMP within VPC
+      VpcId: !Ref VpcA
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.10.0.0/16 }
+  SgAPrivate:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private SG - HTTP within VPC, SSH from Public SG, ICMP within VPC
+      VpcId: !Ref VpcA
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.10.0.0/16 }
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref SgAPublic
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.10.0.0/16 }
+
+  Ec2APublic:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetAPublic
+      SecurityGroupIds: [ !Ref SgAPublic ]
+      Tags: [{ Key: Name, Value: EC2-A-Public }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd
+          cat > /var/www/html/index.html <<'HTML'
+          <h1>EC2-A-Public</h1><p>VPC 10.10.0.0/16, Subnet 10.10.1.0/24</p>
+          HTML
+          systemctl enable --now httpd
+
+  Ec2APrivate:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetAPrivate
+      SecurityGroupIds: [ !Ref SgAPrivate ]
+      Tags: [{ Key: Name, Value: EC2-A-Private }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd
+          cat > /var/www/html/index.html <<'HTML'
+          <h1>EC2-A-Private</h1><p>VPC 10.10.0.0/16, Subnet 10.10.2.0/24</p>
+          HTML
+          systemctl enable --now httpd
+
+  ######################## VPC B ########################
+  VpcB:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab-vpc-b }]
+
+  IgwB:
+    Type: AWS::EC2::InternetGateway
+  AttachIgwB:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VpcB
+      InternetGatewayId: !Ref IgwB
+
+  SubnetBPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcB
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab-b-public }]
+
+  SubnetBPrivate:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcB
+      CidrBlock: 10.20.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab-b-private }]
+
+  RtBPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcB }
+  RtAssocBPublic:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetBPublic, RouteTableId: !Ref RtBPublic }
+  RtBPub0:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtBPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IgwB
+
+  EipNATB:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EipNATB.AllocationId
+      SubnetId: !Ref SubnetBPublic
+      ConnectivityType: public
+      Tags: [{ Key: Name, Value: lab-nat-b }]
+
+  RtBPrivate:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VpcB }
+  RtAssocBPrivate:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetBPrivate, RouteTableId: !Ref RtBPrivate }
+  RtBPri0:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtBPrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+
+  SgBPublic:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public SG - HTTP from world, SSH from your IP, ICMP within VPC
+      VpcId: !Ref VpcB
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.20.0.0/16 }
+  SgBPrivate:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private SG - HTTP within VPC, SSH from Public SG, ICMP within VPC
+      VpcId: !Ref VpcB
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.20.0.0/16 }
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref SgBPublic
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 10.20.0.0/16 }
+
+  Ec2BPublic:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetBPublic
+      SecurityGroupIds: [ !Ref SgBPublic ]
+      Tags: [{ Key: Name, Value: EC2-B-Public }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd
+          cat > /var/www/html/index.html <<'HTML'
+          <h1>EC2-B-Public</h1><p>VPC 10.20.0.0/16, Subnet 10.20.1.0/24</p>
+          HTML
+          systemctl enable --now httpd
+
+  Ec2BPrivate:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetBPrivate
+      SecurityGroupIds: [ !Ref SgBPrivate ]
+      Tags: [{ Key: Name, Value: EC2-B-Private }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd
+          cat > /var/www/html/index.html <<'HTML'
+          <h1>EC2-B-Private</h1><p>VPC 10.20.0.0/16, Subnet 10.20.2.0/24</p>
+          HTML
+          systemctl enable --now httpd
+
+Outputs:
+  APublicIP:
+    Value: !GetAtt Ec2APublic.PublicIp
+    Description: Public IP for EC2-A-Public
+  BPublicIP:
+    Value: !GetAtt Ec2BPublic.PublicIp
+    Description: Public IP for EC2-B-Public
